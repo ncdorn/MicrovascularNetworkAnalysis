@@ -1,7 +1,10 @@
 import numpy as np 
 import pandas as pd
+import os
 import io
 from svzerodtrees._config_handler import ConfigHandler, Vessel, BoundaryCondition, Junction, SimParams
+from svzerodtrees._result_handler import ResultHandler
+from svzerodtrees.utils import *
 
 
 class PSNetwork:
@@ -10,7 +13,7 @@ class PSNetwork:
     Pries et al. 1990 and provides methods to access the data'''
 
     def __init__(self, seg_data: pd.DataFrame, boundary_nodes: list, n_vessels: int):
-        self.filename = filename
+
         self.seg_data = seg_data
         self.boundary_nodes = boundary_nodes
         self.n_vessels = n_vessels
@@ -19,6 +22,8 @@ class PSNetwork:
             self.add_lengths()
 
         self.config_handler = self.generate_zerod_model()
+
+        self.result_handler = ResultHandler.from_config_handler(self.config_handler)
 
 
         # print(self.config_handler.config)
@@ -66,9 +71,10 @@ class PSNetwork:
 
         return cls(seg_data, boundary_nodes, n_vessels)
     
-    def to_file(self, filename: str):
+    def to_json(self, filename: str):
         '''
         write the data to a file, placeholder method at the moment'''
+        
         pass
 
     def add_lengths(self):
@@ -109,10 +115,11 @@ class PSNetwork:
                 bc_map[bc_name] = BoundaryCondition.from_config({'bc_name': bc_name,
                                                                  'bc_type': 'FLOW',
                                                                  'bc_values': {
-                                                                     'Q': [1.0, 1.0], # placeholder
+                                                                     'Q': [100.0, 100.0], # placeholder
                                                                      't': [0.0, 1.0]
                                                                  }
                                                              })
+                vessel_map[row[0]].bc = {"inlet": bc_name}
             else:
                 # add to the outelet vessels of a junction
                 junction_map[row[1]['node_from']].outlet_branches.append(row[0])
@@ -127,6 +134,7 @@ class PSNetwork:
                                                                      'Pd': 0.0
                                                                  }
                                                              })
+                vessel_map[row[0]].bc = {"outlet": bc_name}
             else:
                 # add to the inlet vessels of a junction
                 junction_map[row[1]['node_to']].inlet_branches.append(row[0])
@@ -147,10 +155,10 @@ class PSNetwork:
                                            'vessels': [vessel.to_dict() for vessel in vessel_map.values()],
                                            'boundary_conditions': [bc.to_dict() for bc in bc_map.values()],
                                            'simulation_parameters': sim_params.to_dict()
-                                           })
+                                           },
+                                           is_pulmonary=False)
 
         return config_handler
-
 
 
     def create_vessel_config(self, seg_data_row, viscosity=0.04, stenosis_coefficient=0.0):
@@ -190,9 +198,80 @@ class PSNetwork:
             }
 
 
+    def run_simulation(self):
+        '''
+        run a 0d simulation of the network
+        '''
+
+        print('running simulation...')
+        self.config_handler.simulate(self.result_handler, 'preop')
+
+        print('ran simulation!')
+
+    
+    def get_network_pressures(self, steady: bool=True):
+        '''
+        get lists of the inlet, outlet and mean pressure of the vessels in the network
+        '''
+        
+        p_in = []
+        p_out = []
+        for branch in self.config_handler.vessel_map.keys():
+            p_in.append(get_branch_result(self.result_handler.results['preop'], 'pressure_in', branch, steady=steady)) 
+            p_out.append(get_branch_result(self.result_handler.results['preop'], 'pressure_out', branch, steady=steady))
+
+        p_mean = [(p + p_out[i]) / 2 for i, p in enumerate(p_in)]
+
+        return p_in, p_out, p_mean
+    
+    
+    def get_network_flows(self, steady: bool=True):
+        '''
+        get a list of the flow for each vessel in the network
+        '''
+        
+        q = []
+        for branch in self.config_handler.vessels_map.keys():
+            q.append(get_branch_result(self.result_handler.results['preop'], 'flow_in',branch, steady=steady)) 
+
+        return q
 
 
+    def get_network_wss(self, steady: bool=True):
+        '''
+        get a list of the wall shear stress for each vessel in the network
+        '''
+        
+        wss = []
+        for branch in self.config_handler.vessel_map.keys():
+            wss.append(get_wss(self.result_handler.vessels, self.config_handler.simparams.viscosity, self.result_handler.results['preop'], branch, steady=steady))
 
-if __name__ == "__main__":
-    filename = 'data/23-segments.txt'
-    network = PSNetwork.from_file(filename)
+        return wss
+    
+
+    def plot_vs_p(self, fig_dir: str, steady: bool=True):
+        '''
+        plot the pressure vs wall shear stress for the network
+
+        :param fig_dir: the directory to save the figure to
+        :param steady: whether to use steady or unsteady results
+        '''
+        
+        p_mean = self.get_network_pressures(steady=steady)[2]
+
+        wss = self.get_network_wss(steady=steady)
+        diameters = self.seg_data.segment_diameter
+
+        fig, ax = plt.subplots(2, sharex=True)
+        
+        ax[0].scatter(p_mean, wss)
+        ax[1].scatter(p_mean, diameters)
+        plt.xlabel('Mean Pressure (mmHg)')
+        ax[0].set_ylabel('Wall Shear Stress (Pa)')
+        ax[1].set_ylabel('Diameter (mm)')
+        plt.suptitle('WSS and diameter plotted against mean pressure')
+
+        if os.path.exists(fig_dir) == False:
+            os.mkdir(fig_dir)
+
+        plt.savefig(fig_dir + 'plot_vs_pressure.png')
