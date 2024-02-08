@@ -1,5 +1,8 @@
 import numpy as np 
 import pandas as pd
+import networkx as nx
+import graphviz
+import pydot
 import os
 import io
 from svzerodtrees._config_handler import ConfigHandler, Vessel, BoundaryCondition, Junction, SimParams
@@ -12,16 +15,32 @@ class PSNetwork:
     this class loads a data file of microvascular network connectivity from
     Pries et al. 1990 and provides methods to access the data'''
 
-    def __init__(self, seg_data: pd.DataFrame, boundary_nodes: list, n_vessels: int):
+    def __init__(self, seg_data: pd.DataFrame, boundary_nodes: list, n_vessels: int, q_in: float, R_bc: float):
+        '''
+        initialize the PSNetwork object
+        
+        :param seg_data: a pandas dataframe containing the segment data
+        :param boundary_nodes: a list of the boundary nodes
+        :param n_vessels: the number of vessels in the network
+        :param q_in: the inflow rate of the network
+        :param R_bc: the outflow resistance of the network'''
 
         self.seg_data = seg_data
         self.boundary_nodes = boundary_nodes
         self.n_vessels = n_vessels
+        self.mdl_name = str(n_vessels) + '-vessels'
 
         if 'length' not in seg_data.columns:
             self.add_lengths()
+        
+        # convert seg data from um to cm
+        seg_data['segment_diameter'] = seg_data['segment_diameter'] / 10000
+        seg_data['length'] = seg_data['length'] / 10000
+        # change dtype of columns
+        seg_data = seg_data.astype({'segment_name': 'str', 'node_from': 'int', 'node_to': 'int', 'segment_diameter': 'float', 'length': 'float'})
 
-        self.config_handler = self.generate_zerod_model()
+
+        self.config_handler = self.generate_zerod_model(q_in, R_bc)
 
         self.result_handler = ResultHandler.from_config_handler(self.config_handler)
 
@@ -29,7 +48,7 @@ class PSNetwork:
         # print(self.config_handler.config)
     ### I/O METHODDS ###
     @classmethod
-    def from_file(cls, filename: str):
+    def from_file(cls, filename: str, q_in, R_bc):
         '''
         read the data in from a file and return a PSNetwork object'''
         # format the data into two dataframes since the initial conformation is... inconvenient
@@ -66,10 +85,8 @@ class PSNetwork:
 
         # read the data into pandas dataframes
         seg_data = pd.read_csv(io.StringIO('\n'.join(seg_data_list)), sep='\s+')
-        # change dtype of columns
-        seg_data = seg_data.astype({'segment_name': 'str', 'node_from': 'int', 'node_to': 'int', 'segment_diameter': 'float'})
 
-        return cls(seg_data, boundary_nodes, n_vessels)
+        return cls(seg_data, boundary_nodes, n_vessels, q_in, R_bc)
     
     def to_json(self, filename: str):
         '''
@@ -90,7 +107,7 @@ class PSNetwork:
     ### END OF I/O METHODS ###
 
 
-    def generate_zerod_model(self):
+    def generate_zerod_model(self, q_in=100.0, R_bc=100.0):
         '''
         generate a map of the vessels in the network as zerodsolver objects'''
         
@@ -115,7 +132,7 @@ class PSNetwork:
                 bc_map[bc_name] = BoundaryCondition.from_config({'bc_name': bc_name,
                                                                  'bc_type': 'FLOW',
                                                                  'bc_values': {
-                                                                     'Q': [100.0, 100.0], # placeholder
+                                                                     'Q': [q_in, q_in], # placeholder
                                                                      't': [0.0, 1.0]
                                                                  }
                                                              })
@@ -130,7 +147,7 @@ class PSNetwork:
                 bc_map[bc_name] = BoundaryCondition.from_config({'bc_name': bc_name,
                                                                  'bc_type': 'RESISTANCE',
                                                                  'bc_values': {
-                                                                     'R': 10.0, # placeholder
+                                                                     'R': R_bc, # placeholder
                                                                      'Pd': 0.0
                                                                  }
                                                              })
@@ -217,8 +234,8 @@ class PSNetwork:
         p_in = []
         p_out = []
         for branch in self.config_handler.vessel_map.keys():
-            p_in.append(get_branch_result(self.result_handler.results['preop'], 'pressure_in', branch, steady=steady)) 
-            p_out.append(get_branch_result(self.result_handler.results['preop'], 'pressure_out', branch, steady=steady))
+            p_in.append(d2m(get_branch_result(self.result_handler.results['preop'], 'pressure_in', branch, steady=steady)))
+            p_out.append(d2m(get_branch_result(self.result_handler.results['preop'], 'pressure_out', branch, steady=steady)))
 
         p_mean = [(p + p_out[i]) / 2 for i, p in enumerate(p_in)]
 
@@ -267,11 +284,52 @@ class PSNetwork:
         ax[0].scatter(p_mean, wss)
         ax[1].scatter(p_mean, diameters)
         plt.xlabel('Mean Pressure (mmHg)')
-        ax[0].set_ylabel('Wall Shear Stress (Pa)')
+        ax[0].set_ylabel('Wall Shear Stress (dyn/cm2)')
         ax[1].set_ylabel('Diameter (mm)')
+        # plt.xscale('log')
+        # plt.xlim((10, 100))
         plt.suptitle('WSS and diameter plotted against mean pressure')
 
         if os.path.exists(fig_dir) == False:
             os.mkdir(fig_dir)
 
         plt.savefig(fig_dir + 'plot_vs_pressure.png')
+
+    
+    def visualize(self, fig_dir: str):
+        '''
+        visualize the network as a graph
+        '''
+        # generate the block list as [vessels, bcs]
+        block_dict = dict(self.config_handler.vessel_map, **self.config_handler.bcs)
+
+        connectivity = []
+        # compute vesselc onnectivity based on junction info
+        for junction in self.config_handler.junctions.values():
+            for inlet in junction.inlet_branches:
+                for outlet in junction.outlet_branches:
+                    connectivity.append((inlet, outlet))
+
+        # compute connectivity between vessels and boundary conditions
+        for vessel in self.config_handler.vessel_map.values():
+            if vessel.bc is not None:
+                connectivity.append((vessel.id, list(vessel.bc.values())[0]))
+        
+        plt.figure(figsize=(20, 11))
+        G = nx.DiGraph()
+        G.add_edges_from([(block_dict[tpl[0]].name, block_dict[tpl[1]].name) for tpl in connectivity])
+        # nx.draw(G)
+        # pos = nx.planar_layout(G)
+        # pos = nx.spring_layout(G)
+        pos = nx.nx_pydot.pydot_layout(G, prog='dot') # see other graph layouts: https://stackoverflow.com/questions/21978487/improving-python-networkx-graph-layout
+        nx.draw_networkx_nodes(G,pos)
+        nx.draw_networkx_labels(G,pos)
+        nx.draw_networkx_edges(G,pos)
+
+        plt.tight_layout()
+        plt.savefig(fig_dir + self.mdl_name + "_graph.png", format="PNG")
+        # plt.show()
+        nx.nx_pydot.write_dot(G, fig_dir + self.mdl_name + "_graph.dot")
+        plt.close("all")
+
+            
